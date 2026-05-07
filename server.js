@@ -15,7 +15,9 @@ const allowedOrigins = [
     'http://localhost:5500', // For local development testing
     'http://127.0.0.1:5500',
     'http://localhost:3000',
-    'https://calisto.github.io' // Your live frontend
+    'https://calisto.github.io',
+    'https://fahmimrann.github.io',
+    'https://fahmimrann.github.io/calisto.github.io' // Your live frontend
 ];
 
 app.use(cors({
