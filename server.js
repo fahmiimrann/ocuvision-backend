@@ -16,6 +16,8 @@ const allowedOrigins = [
     'http://127.0.0.1:5500',
     'http://localhost:3000',
     'https://calisto.github.io',
+    'https://fahmiimrann.github.io',
+    'https://fahmiimrann.github.io/calisto.github.io',
     'https://fahmimrann.github.io',
     'https://fahmimrann.github.io/calisto.github.io' // Your live frontend
 ];
