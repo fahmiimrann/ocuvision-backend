@@ -1,0 +1,16 @@
+{
+  "name": "ocuvision-backend",
+  "version": "1.0.0",
+  "description": "Node.js backend for OcuVision AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "multer": "^1.4.5-lts.1"
+  }
+}
