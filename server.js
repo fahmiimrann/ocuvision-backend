@@ -3,13 +3,19 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
+
+const db = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const upload = multer({ storage: multer.memoryStorage() });
+
+// --- Storage paths (model registry only — user/record data lives in db.js) ---
 const MODEL_DIR = path.join(__dirname, 'uploaded-models');
 const MODEL_REGISTRY_FILE = path.join(MODEL_DIR, 'models.json');
+
 const DEFAULT_MODEL = {
     id: 'demo-retina-core',
     name: 'Demo Retina Core',
@@ -19,6 +25,31 @@ const DEFAULT_MODEL = {
     uploadedAt: '2026-05-07T00:00:00.000Z',
     active: true
 };
+
+// --- Auth helpers ----------------------------------------------------------
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+function publicUser(user) {
+    if (!user) return null;
+    const { password, token, ...safe } = user;
+    return safe;
+}
+
+async function requireAuth(req, res, next) {
+    try {
+        const header = req.headers.authorization || '';
+        const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+        const user = await db.findUserByToken(token);
+        if (!user) return res.status(401).json({ error: 'Authentication required.' });
+        req.user = user;
+        req.token = token;
+        next();
+    } catch (err) {
+        next(err);
+    }
+}
 
 function ensureModelRegistry() {
     if (!fs.existsSync(MODEL_DIR)) {
@@ -90,7 +121,7 @@ app.use(cors({
     }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 // Base route to verify the API is running
 app.get('/', (req, res) => {
@@ -102,42 +133,126 @@ app.get('/', (req, res) => {
     });
 });
 
-// Demo login endpoint used by index.html.
-// Replace this with database-backed authentication before real clinical use.
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
+// Login: validates against persisted users and issues a session token.
+app.post('/api/login', async (req, res, next) => {
+    try {
+        const { username, password } = req.body || {};
+        if (!username || !password) {
+            return res.status(400).json({ error: 'Username and password are required.' });
+        }
 
-    const demoUsers = [
-        { username: '1', password: '1', type: 'intern', name: 'Fahmi' },
-        { username: 'doctor', password: 'ocularxr', type: 'doctor', name: 'Dr. Julian Voss' },
-        { username: 'nurse', password: 'nurs3', type: 'nurse', name: 'Nurse Meera Syed' }
-    ];
+        const user = await db.findUserByUsername(username);
+        if (!user || user.password !== password) {
+            return res.status(401).json({ error: 'Invalid username or password.' });
+        }
 
-    const user = demoUsers.find(item => item.username === username && item.password === password);
-
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid username or password.' });
+        const token = generateToken();
+        const updated = await db.setUserToken(user.id, token);
+        res.json({ user: publicUser(updated), token });
+    } catch (err) {
+        next(err);
     }
-
-    const { password: _password, ...safeUser } = user;
-    res.json({ user: safeUser });
 });
 
-// Demo register endpoint. This returns the user to the frontend, but does not persist yet.
-app.post('/api/register', (req, res) => {
-    const { username, name, type } = req.body;
-
-    if (!username || !name || !type) {
-        return res.status(400).json({ error: 'Name, username, and type are required.' });
-    }
-
-    res.status(201).json({
-        user: {
-            username,
-            name,
-            type
+// Register: persists the new user and issues a session token.
+app.post('/api/register', async (req, res, next) => {
+    try {
+        const { username, name, type, password, email } = req.body || {};
+        if (!username || !name || !type || !password) {
+            return res.status(400).json({ error: 'Name, username, password, and type are required.' });
         }
-    });
+
+        const existing = await db.findUserByUsername(username);
+        if (existing) return res.status(409).json({ error: 'Username is already taken.' });
+
+        const token = generateToken();
+        const user = {
+            id: `u-${Date.now()}`,
+            username,
+            password,
+            name,
+            type,
+            email: email || `${username}@calisto.com`,
+            avatar: '',
+            created_at: new Date().toISOString(),
+            token
+        };
+        const inserted = await db.insertUser(user);
+        res.status(201).json({ user: publicUser(inserted), token });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Logout: clears the session token for the current user.
+app.post('/api/logout', requireAuth, async (req, res, next) => {
+    try {
+        await db.setUserToken(req.user.id, null);
+        res.json({ ok: true });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Re-verify the current user's password (used before destructive actions).
+app.post('/api/auth/verify', requireAuth, (req, res) => {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'Password is required.' });
+    if (req.user.password !== password) {
+        return res.status(401).json({ error: 'Incorrect password.' });
+    }
+    res.json({ ok: true });
+});
+
+// Return the currently authenticated user.
+app.get('/api/users/me', requireAuth, (req, res) => {
+    res.json({ user: publicUser(req.user) });
+});
+
+// Update the authenticated user's profile (name, username, email, avatar).
+app.patch('/api/users/me', requireAuth, async (req, res, next) => {
+    try {
+        const { name, username, email, avatar } = req.body || {};
+        const patch = {};
+
+        if (username && username !== req.user.username) {
+            const conflict = await db.findUserByUsername(username);
+            if (conflict && conflict.id !== req.user.id) {
+                return res.status(409).json({ error: 'Username is already taken.' });
+            }
+            patch.username = username;
+        }
+        if (typeof name === 'string'   && name.trim())   patch.name = name.trim();
+        if (typeof email === 'string')                   patch.email = email.trim();
+        if (typeof avatar === 'string')                  patch.avatar = avatar;
+
+        const updated = await db.patchUser(req.user.id, patch);
+        if (!updated) return res.status(404).json({ error: 'User not found.' });
+        res.json({ user: publicUser(updated) });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Change the authenticated user's password (requires current password).
+app.post('/api/users/me/password', requireAuth, async (req, res, next) => {
+    try {
+        const { currentPassword, newPassword } = req.body || {};
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ error: 'Current and new password are required.' });
+        }
+        if (req.user.password !== currentPassword) {
+            return res.status(401).json({ error: 'Current password is incorrect.' });
+        }
+        if (newPassword.length < 4) {
+            return res.status(400).json({ error: 'New password must be at least 4 characters.' });
+        }
+
+        await db.patchUser(req.user.id, { password: newPassword });
+        res.json({ ok: true });
+    } catch (err) {
+        next(err);
+    }
 });
 
 // Demo AI analysis endpoint used by the diagnostics image upload flow.
@@ -240,16 +355,122 @@ app.post('/api/models/select', (req, res) => {
     });
 });
 
-// Example API endpoint for patient records
-app.get('/api/records', (req, res) => {
-    const mockRecords = [
-        { id: 'REC001', patient: 'John Doe', result: 'Healthy', date: '2024-05-20' },
-        { id: 'REC002', patient: 'Jane Smith', result: 'Glaucoma Risk', date: '2024-05-21' },
-        { id: 'REC003', patient: 'Robert Chen', result: 'Macular Degeneration', date: '2024-05-22' }
-    ];
-    res.json(mockRecords);
+// --- Patient records CRUD --------------------------------------------------
+function nextRecordId() {
+    return `OCU-${Date.now().toString().slice(-6)}`;
+}
+
+function normalizeRecordPayload(body = {}) {
+    const allowed = ['patient', 'age', 'gender', 'date', 'result', 'confidence', 'doctor', 'severity'];
+    const record = {};
+    for (const key of allowed) {
+        if (body[key] !== undefined) record[key] = body[key];
+    }
+    if (record.age !== undefined) {
+        const n = Number(record.age);
+        if (!Number.isFinite(n)) {
+            return { error: 'Age must be a number.' };
+        }
+        record.age = n;
+    }
+    if (typeof record.patient === 'string') record.patient = record.patient.trim();
+    if (typeof record.doctor === 'string')  record.doctor  = record.doctor.trim();
+    return { record };
+}
+
+// List all patient records.
+app.get('/api/records', requireAuth, async (_req, res, next) => {
+    try {
+        const records = await db.getAllRecords();
+        res.json({ records });
+    } catch (err) {
+        next(err);
+    }
 });
 
-app.listen(PORT, () => {
-    console.log(`OcuVision Server is running on port ${PORT}`);
+// Create a new patient record from a finalized scan.
+app.post('/api/records', requireAuth, async (req, res, next) => {
+    try {
+        const { record, error } = normalizeRecordPayload(req.body);
+        if (error) return res.status(400).json({ error });
+        if (!record.patient) return res.status(400).json({ error: 'Patient name is required.' });
+
+        const newRecord = {
+            id: req.body.id || nextRecordId(),
+            patient: record.patient,
+            age: record.age ?? 0,
+            gender: record.gender || 'Other',
+            date: record.date || new Date().toISOString().slice(0, 10),
+            result: record.result || 'No urgent retinal abnormality detected',
+            confidence: record.confidence || '0%',
+            doctor: record.doctor || req.user.name || 'Unassigned',
+            severity: record.severity || 'Healthy',
+            created_by: req.user.username,
+            created_at: new Date().toISOString()
+        };
+
+        const inserted = await db.insertRecord(newRecord);
+        res.status(201).json({ record: inserted });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Update an existing patient record. The client must include the user's
+// password in the body so the server can re-verify before the change.
+app.patch('/api/records/:id', requireAuth, async (req, res, next) => {
+    try {
+        const { password, ...changes } = req.body || {};
+        if (!password || password !== req.user.password) {
+            return res.status(401).json({ error: 'Password verification failed.' });
+        }
+
+        const { record, error } = normalizeRecordPayload(changes);
+        if (error) return res.status(400).json({ error });
+
+        const existing = await db.findRecordById(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Record not found.' });
+
+        const patch = {
+            ...record,
+            updated_by: req.user.username,
+            updated_at: new Date().toISOString()
+        };
+
+        const updated = await db.patchRecord(req.params.id, patch);
+        res.json({ record: updated });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Delete a patient record. Same password re-verification rules as PATCH.
+app.delete('/api/records/:id', requireAuth, async (req, res, next) => {
+    try {
+        const password = req.body?.password || req.headers['x-reauth-password'];
+        if (!password || password !== req.user.password) {
+            return res.status(401).json({ error: 'Password verification failed.' });
+        }
+
+        const removed = await db.deleteRecord(req.params.id);
+        if (!removed) return res.status(404).json({ error: 'Record not found.' });
+        res.json({ ok: true, record: removed });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Centralised error handler so async failures show as JSON instead of HTML.
+app.use((err, _req, res, _next) => {
+    console.error('[server] error', err);
+    res.status(500).json({ error: err.message || 'Internal server error.' });
+});
+
+db.init().then(() => {
+    app.listen(PORT, () => {
+        console.log(`OcuVision Server is running on port ${PORT}`);
+    });
+}).catch(err => {
+    console.error('[server] failed to initialise data layer:', err.message);
+    process.exit(1);
 });
