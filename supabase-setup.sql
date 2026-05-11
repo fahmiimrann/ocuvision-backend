@@ -23,20 +23,24 @@ create index if not exists idx_users_token on public.users (token);
 -- PATIENT RECORDS
 -- ---------------------------------------------------------------------------
 create table if not exists public.records (
-    id          text primary key,
-    patient     text not null,
-    age         integer default 0,
-    gender      text default 'Other',
-    date        date,
-    result      text default '',
-    confidence  text default '0%',
-    doctor      text default 'Unassigned',
-    severity    text default 'Healthy',
-    created_by  text,
-    updated_by  text,
-    created_at  timestamptz default now(),
-    updated_at  timestamptz
+    id            text primary key,
+    patient       text not null,
+    age           integer default 0,
+    gender        text default 'Other',
+    date          date,
+    result        text default '',
+    confidence    text default '0%',
+    doctor        text default 'Unassigned',
+    severity      text default 'Healthy',
+    fundus_image  text,
+    created_by    text,
+    updated_by    text,
+    created_at    timestamptz default now(),
+    updated_at    timestamptz
 );
+
+-- For databases that were created before the fundus_image column existed.
+alter table public.records add column if not exists fundus_image text;
 
 create index if not exists idx_records_created_at on public.records (created_at desc);
 
@@ -67,7 +71,6 @@ insert into public.records (id, patient, age, gender, date, result, confidence, 
     ('OCU-9923', 'Sarah Miller',    26, 'Female', '2026-04-27', 'Healthy',              '98.8%', 'Dr. Julian Voss',  'Healthy'),
     ('OCU-1125', 'Aliyah Rahman',   59, 'Female', '2026-04-26', 'Diabetic Retinopathy', '82.0%', 'Nurse Meera Syed', 'Critical'),
     ('OCU-1126', 'Paul Garnier',    72, 'Male',   '2026-04-24', 'AMD',                  '91.6%', 'Dr. Julian Voss',  'Moderate'),
-    ('OCU-1127', 'Noor Fatimah',    64, 'Female', '2026-04-22', 'Cataract',             '93.1%', 'Nurse Meera Syed', 'Moderate'),
     ('OCU-1128', 'Tan Wei',         48, 'Male',   '2026-04-20', 'Glaucoma',             '90.8%', 'Dr. Julian Voss',  'Critical'),
     ('OCU-1129', 'Siti Aminah',     54, 'Female', '2026-04-18', 'Healthy',              '98.1%', 'Nurse Meera Syed', 'Healthy')
 on conflict (id) do nothing;
