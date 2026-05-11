@@ -2,11 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 require('dotenv').config();
 
 const db = require('./db');
+const { runMatlabModel, isMatlabModelFile } = require('./matlab-runner');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -121,7 +123,9 @@ app.use(cors({
     }
 }));
 
-app.use(express.json({ limit: '5mb' }));
+// Bumped to 25 MB so a base64 fundus image (typically 1–3 MB) easily fits
+// inside the record JSON body sent by the frontend.
+app.use(express.json({ limit: '25mb' }));
 
 // Base route to verify the API is running
 app.get('/', (req, res) => {
@@ -255,48 +259,116 @@ app.post('/api/users/me/password', requireAuth, async (req, res, next) => {
     }
 });
 
-// Demo AI analysis endpoint used by the diagnostics image upload flow.
-app.post('/api/analyze', upload.single('image'), (req, res) => {
+// --- Demo result helpers ---------------------------------------------------
+const DEMO_RESULTS = [
+    {
+        status: 'Alert',
+        score: '94.8',
+        result: 'Diabetic Retinopathy',
+        severity: 'Critical',
+        notes: 'Multiple microaneurysms and intraretinal hemorrhages detected. Expert validation recommended.'
+    },
+    {
+        status: 'Warning',
+        score: '89.3',
+        result: 'Early Glaucoma indicators detected',
+        severity: 'Moderate',
+        notes: 'Cup-to-disc ratio and vessel morphology should be reviewed by an ophthalmologist.'
+    },
+    {
+        status: 'Optimal',
+        score: '98.7',
+        result: 'No urgent retinal abnormality detected',
+        severity: 'Healthy',
+        notes: 'Fundus pattern is within baseline range for this demo backend screening.'
+    }
+];
+
+function pickDemoResult() {
+    return DEMO_RESULTS[Math.floor(Math.random() * DEMO_RESULTS.length)];
+}
+
+function deriveStatus(severity = '', result = '') {
+    const sev = String(severity).toLowerCase();
+    const res = String(result).toLowerCase();
+    if (sev.includes('critical') || res.includes('retinopathy') || res.includes('glaucoma')) return 'Alert';
+    if (sev.includes('moderate') || res.includes('early') || res.includes('amd')) return 'Warning';
+    return 'Optimal';
+}
+
+function writeTempImage(buffer, originalName) {
+    const safeBase = path.basename(originalName || 'fundus.png').replace(/[^a-z0-9._-]/gi, '_');
+    const tmpPath = path.join(os.tmpdir(), `ocu-${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safeBase}`);
+    fs.writeFileSync(tmpPath, buffer);
+    return tmpPath;
+}
+
+// AI analysis endpoint used by the diagnostics image upload flow.
+// If the active model is a MATLAB script (.m / .mlx) it is executed via the
+// MATLAB runner; otherwise the demo backend logic returns a sample result.
+app.post('/api/analyze', upload.single('image'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No image uploaded.' });
     }
 
     const activeModel = getActiveModel();
-    const demoResults = [
-        {
-            status: 'Alert',
-            score: '94.8',
-            result: 'Diabetic Retinopathy',
-            severity: 'Critical',
-            notes: 'Multiple microaneurysms and intraretinal hemorrhages detected. Expert validation recommended.'
-        },
-        {
-            status: 'Warning',
-            score: '89.3',
-            result: 'Early Glaucoma indicators detected',
-            severity: 'Moderate',
-            notes: 'Cup-to-disc ratio and vessel morphology should be reviewed by an ophthalmologist.'
-        },
-        {
-            status: 'Optimal',
-            score: '98.7',
-            result: 'No urgent retinal abnormality detected',
-            severity: 'Healthy',
-            notes: 'Fundus pattern is within baseline range for this demo backend screening.'
-        }
-    ];
+    const modelName = activeModel?.name || 'Demo Retina Core';
+    const storedFile = activeModel?.storedFile
+        ? path.join(MODEL_DIR, activeModel.storedFile)
+        : null;
 
-    const result = demoResults[Math.floor(Math.random() * demoResults.length)];
+    let tempImagePath = null;
+    try {
+        // MATLAB path: only when a real .m / .mlx file has been uploaded.
+        if (
+            storedFile &&
+            fs.existsSync(storedFile) &&
+            isMatlabModelFile(activeModel.originalName || storedFile)
+        ) {
+            tempImagePath = writeTempImage(req.file.buffer, req.file.originalname);
+            const matlabRaw = await runMatlabModel({
+                scriptPath: storedFile,
+                imagePath: tempImagePath
+            });
 
-    res.json({
-        ...result,
-        confidence: `${result.score}%`,
-        fileName: req.file.originalname,
-        model: {
-            id: activeModel.id,
-            name: activeModel.name
+            const diagnosis = matlabRaw.diagnosis || matlabRaw.result || 'No urgent retinal abnormality detected';
+            const scoreNum  = Number(matlabRaw.score ?? matlabRaw.confidence ?? 0);
+            const scoreStr  = Number.isFinite(scoreNum) ? scoreNum.toFixed(1) : '0.0';
+            const severity  = matlabRaw.severity || 'Healthy';
+            const notes     = matlabRaw.notes || 'MATLAB model analysis completed.';
+            const status    = matlabRaw.status || deriveStatus(severity, diagnosis);
+
+            return res.json({
+                status,
+                score: scoreStr,
+                result: diagnosis,
+                severity,
+                notes,
+                confidence: `${scoreStr}%`,
+                fileName: req.file.originalname,
+                model: { id: activeModel.id, name: modelName, runtime: 'matlab' }
+            });
         }
-    });
+
+        // Fallback: demo logic for the built-in model or non-MATLAB uploads.
+        const result = pickDemoResult();
+        return res.json({
+            ...result,
+            confidence: `${result.score}%`,
+            fileName: req.file.originalname,
+            model: { id: activeModel.id, name: modelName, runtime: activeModel.type || 'demo' }
+        });
+    } catch (err) {
+        console.error('[analyze] MATLAB pipeline failed:', err.message);
+        return res.status(502).json({
+            error: `Active AI model failed to run: ${err.message}`,
+            model: { id: activeModel.id, name: modelName }
+        });
+    } finally {
+        if (tempImagePath) {
+            fs.unlink(tempImagePath, () => {});
+        }
+    }
 });
 
 // Model registry endpoints for Preferences > AI Core.
@@ -361,7 +433,7 @@ function nextRecordId() {
 }
 
 function normalizeRecordPayload(body = {}) {
-    const allowed = ['patient', 'age', 'gender', 'date', 'result', 'confidence', 'doctor', 'severity'];
+    const allowed = ['patient', 'age', 'gender', 'date', 'result', 'confidence', 'doctor', 'severity', 'fundus_image'];
     const record = {};
     for (const key of allowed) {
         if (body[key] !== undefined) record[key] = body[key];
@@ -405,6 +477,7 @@ app.post('/api/records', requireAuth, async (req, res, next) => {
             confidence: record.confidence || '0%',
             doctor: record.doctor || req.user.name || 'Unassigned',
             severity: record.severity || 'Healthy',
+            fundus_image: record.fundus_image || null,
             created_by: req.user.username,
             created_at: new Date().toISOString()
         };
