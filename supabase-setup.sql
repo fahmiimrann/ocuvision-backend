@@ -33,14 +33,16 @@ create table if not exists public.records (
     doctor        text default 'Unassigned',
     severity      text default 'Healthy',
     fundus_image  text,
+    features      jsonb,
     created_by    text,
     updated_by    text,
     created_at    timestamptz default now(),
     updated_at    timestamptz
 );
 
--- For databases that were created before the fundus_image column existed.
+-- For databases that were created before the new columns existed.
 alter table public.records add column if not exists fundus_image text;
+alter table public.records add column if not exists features     jsonb;
 
 create index if not exists idx_records_created_at on public.records (created_at desc);
 
