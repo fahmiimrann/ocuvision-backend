@@ -260,27 +260,56 @@ app.post('/api/users/me/password', requireAuth, async (req, res, next) => {
 });
 
 // --- Demo result helpers ---------------------------------------------------
+// Baseline feature vectors per condition. These mirror the ranges used by
+// the frontend report generator so that, even in demo mode, the Patient
+// Report shows numbers consistent with the diagnosis. When a real MATLAB
+// model is active these values are replaced by the actual computed
+// feature vector returned by the model.
 const DEMO_RESULTS = [
     {
         status: 'Alert',
         score: '94.8',
         result: 'Diabetic Retinopathy',
         severity: 'Critical',
-        notes: 'Multiple microaneurysms and intraretinal hemorrhages detected. Expert validation recommended.'
+        notes: 'Multiple microaneurysms and intraretinal hemorrhages detected. Expert validation recommended.',
+        features: {
+            GLCM_Contrast: 71.4, GLCM_Correlation: 0.886, GLCM_Energy: 0.108, GLCM_Homogeneity: 0.461,
+            Intensity_Mean: 122.5, Intensity_StdDev: 66.1, Intensity_Skewness: 0.83, Intensity_Kurtosis: 0.22,
+            Intensity_Variance: 4369.21, Intensity_LogKurt: -1.514, Intensity_Smoothness: 0.99977,
+            Intensity_Entropy: 7.61, Intensity_Uniformity: 0.0061, Intensity_DynRange: 252,
+            Vessel_GVD_pct: 9.5, Vessel_MaxLVD: 0.38, Vessel_Symmetry: 0.70,
+            ONH_DiscArea_px2: 6800, ONH_CupToDiscRatio: 0.34
+        }
     },
     {
         status: 'Warning',
         score: '89.3',
         result: 'Early Glaucoma indicators detected',
         severity: 'Moderate',
-        notes: 'Cup-to-disc ratio and vessel morphology should be reviewed by an ophthalmologist.'
+        notes: 'Cup-to-disc ratio and vessel morphology should be reviewed by an ophthalmologist.',
+        features: {
+            GLCM_Contrast: 42.6, GLCM_Correlation: 0.948, GLCM_Energy: 0.151, GLCM_Homogeneity: 0.547,
+            Intensity_Mean: 118.7, Intensity_StdDev: 51.4, Intensity_Skewness: 0.28, Intensity_Kurtosis: -0.78,
+            Intensity_Variance: 2641.96, Intensity_LogKurt: -0.248, Intensity_Smoothness: 0.99962,
+            Intensity_Entropy: 7.31, Intensity_Uniformity: 0.0079, Intensity_DynRange: 249,
+            Vessel_GVD_pct: 10.2, Vessel_MaxLVD: 0.31, Vessel_Symmetry: 0.91,
+            ONH_DiscArea_px2: 7400, ONH_CupToDiscRatio: 0.52
+        }
     },
     {
         status: 'Optimal',
         score: '98.7',
         result: 'No urgent retinal abnormality detected',
         severity: 'Healthy',
-        notes: 'Fundus pattern is within baseline range for this demo backend screening.'
+        notes: 'Fundus pattern is within baseline range for this demo backend screening.',
+        features: {
+            GLCM_Contrast: 34.5, GLCM_Correlation: 0.953, GLCM_Energy: 0.156, GLCM_Homogeneity: 0.552,
+            Intensity_Mean: 118.4, Intensity_StdDev: 52.0, Intensity_Skewness: 0.25, Intensity_Kurtosis: -0.81,
+            Intensity_Variance: 2704.00, Intensity_LogKurt: -0.211, Intensity_Smoothness: 0.99963,
+            Intensity_Entropy: 7.32, Intensity_Uniformity: 0.0078, Intensity_DynRange: 250,
+            Vessel_GVD_pct: 11.6, Vessel_MaxLVD: 0.31, Vessel_Symmetry: 0.93,
+            ONH_DiscArea_px2: 6800, ONH_CupToDiscRatio: 0.29
+        }
     }
 ];
 
@@ -337,6 +366,9 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
             const severity  = matlabRaw.severity || 'Healthy';
             const notes     = matlabRaw.notes || 'MATLAB model analysis completed.';
             const status    = matlabRaw.status || deriveStatus(severity, diagnosis);
+            const features  = matlabRaw.features && typeof matlabRaw.features === 'object'
+                ? matlabRaw.features
+                : null;
 
             return res.json({
                 status,
@@ -346,6 +378,7 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
                 notes,
                 confidence: `${scoreStr}%`,
                 fileName: req.file.originalname,
+                features,
                 model: { id: activeModel.id, name: modelName, runtime: 'matlab' }
             });
         }
@@ -356,6 +389,7 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
             ...result,
             confidence: `${result.score}%`,
             fileName: req.file.originalname,
+            features: result.features || null,
             model: { id: activeModel.id, name: modelName, runtime: activeModel.type || 'demo' }
         });
     } catch (err) {
@@ -433,7 +467,7 @@ function nextRecordId() {
 }
 
 function normalizeRecordPayload(body = {}) {
-    const allowed = ['patient', 'age', 'gender', 'date', 'result', 'confidence', 'doctor', 'severity', 'fundus_image'];
+    const allowed = ['patient', 'age', 'gender', 'date', 'result', 'confidence', 'doctor', 'severity', 'fundus_image', 'features'];
     const record = {};
     for (const key of allowed) {
         if (body[key] !== undefined) record[key] = body[key];
@@ -478,6 +512,7 @@ app.post('/api/records', requireAuth, async (req, res, next) => {
             doctor: record.doctor || req.user.name || 'Unassigned',
             severity: record.severity || 'Healthy',
             fundus_image: record.fundus_image || null,
+            features: record.features || null,
             created_by: req.user.username,
             created_at: new Date().toISOString()
         };
