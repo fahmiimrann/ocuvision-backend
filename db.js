@@ -27,7 +27,6 @@ const SEED_RECORDS = [
     { id: 'OCU-9923', patient: 'Sarah Miller',    age: 26, gender: 'Female', date: '2026-04-27', result: 'Healthy',              confidence: '98.8%', doctor: 'Dr. Julian Voss',  severity: 'Healthy'  },
     { id: 'OCU-1125', patient: 'Aliyah Rahman',   age: 59, gender: 'Female', date: '2026-04-26', result: 'Diabetic Retinopathy', confidence: '82.0%', doctor: 'Nurse Meera Syed', severity: 'Critical' },
     { id: 'OCU-1126', patient: 'Paul Garnier',    age: 72, gender: 'Male',   date: '2026-04-24', result: 'AMD',                  confidence: '91.6%', doctor: 'Dr. Julian Voss',  severity: 'Moderate' },
-    { id: 'OCU-1127', patient: 'Noor Fatimah',    age: 64, gender: 'Female', date: '2026-04-22', result: 'Cataract',             confidence: '93.1%', doctor: 'Nurse Meera Syed', severity: 'Moderate' },
     { id: 'OCU-1128', patient: 'Tan Wei',         age: 48, gender: 'Male',   date: '2026-04-20', result: 'Glaucoma',             confidence: '90.8%', doctor: 'Dr. Julian Voss',  severity: 'Critical' },
     { id: 'OCU-1129', patient: 'Siti Aminah',     age: 54, gender: 'Female', date: '2026-04-18', result: 'Healthy',              confidence: '98.1%', doctor: 'Nurse Meera Syed', severity: 'Healthy'  }
 ];
