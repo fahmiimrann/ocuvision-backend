@@ -44,10 +44,63 @@
  */
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
-const MATLAB_EXEC = process.env.MATLAB_EXEC || 'matlab';
+// ---------------------------------------------------------------------------
+// Locate the MATLAB executable.
+//
+// Priority:
+//   1. The MATLAB_EXEC environment variable (typically set via .env).
+//   2. On Windows, scan the standard install locations for the newest
+//      installed release (e.g. C:\Program Files\MATLAB\R2025b\bin\matlab.exe).
+//   3. Fall back to the bare command "matlab" and hope it's on PATH.
+//
+// This means a fresh clone of the project on a typical Windows workstation
+// will Just Work — no PowerShell env-var setup required — as long as MATLAB
+// itself is installed in the usual `Program Files\MATLAB\<RELEASE>\` layout.
+// ---------------------------------------------------------------------------
+function findMatlabOnWindows() {
+    if (process.platform !== 'win32') return null;
+    const roots = [
+        'C:\\Program Files\\MATLAB',
+        'C:\\Program Files (x86)\\MATLAB'
+    ];
+    const releases = [];
+    for (const root of roots) {
+        try {
+            const entries = fs.readdirSync(root, { withFileTypes: true });
+            for (const entry of entries) {
+                if (!entry.isDirectory()) continue;
+                const exe = path.join(root, entry.name, 'bin', 'matlab.exe');
+                if (fs.existsSync(exe)) {
+                    releases.push({ name: entry.name, exe });
+                }
+            }
+        } catch (_) {
+            // Folder doesn't exist — skip silently.
+        }
+    }
+    if (releases.length === 0) return null;
+    // Sort so that R-prefixed releases are picked newest first (R2025b > R2024a > R2023b).
+    releases.sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+    return releases[0].exe;
+}
+
+function resolveMatlabExec() {
+    const fromEnv = (process.env.MATLAB_EXEC || '').trim();
+    if (fromEnv) return fromEnv;
+    const autoDetected = findMatlabOnWindows();
+    if (autoDetected) return autoDetected;
+    return 'matlab';
+}
+
+const MATLAB_EXEC = resolveMatlabExec();
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.MATLAB_TIMEOUT_MS || '120000', 10);
+
+// One-time startup log so the server operator can confirm which MATLAB binary
+// will be invoked when an .m / .mlx / .mat model is uploaded.
+console.log(`[matlab-runner] MATLAB executable resolved to: ${MATLAB_EXEC}`);
 
 function quoteForMatlab(str) {
     return String(str).replace(/'/g, "''");
