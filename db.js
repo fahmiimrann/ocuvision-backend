@@ -22,13 +22,13 @@ const SEED_USERS = [
 ];
 
 const SEED_RECORDS = [
-    { id: 'OCU-9921', patient: 'Elena Rodriguez', age: 37, gender: 'Female', date: '2026-04-29', result: 'Healthy',              confidence: '99.2%', doctor: 'Dr. Julian Voss',  severity: 'Healthy'  },
-    { id: 'OCU-9922', patient: 'Marcus Chen',     age: 41, gender: 'Male',   date: '2026-04-28', result: 'Early Glaucoma',       confidence: '87.4%', doctor: 'Dr. Julian Voss',  severity: 'Moderate' },
-    { id: 'OCU-9923', patient: 'Sarah Miller',    age: 26, gender: 'Female', date: '2026-04-27', result: 'Healthy',              confidence: '98.8%', doctor: 'Dr. Julian Voss',  severity: 'Healthy'  },
-    { id: 'OCU-1125', patient: 'Aliyah Rahman',   age: 59, gender: 'Female', date: '2026-04-26', result: 'Diabetic Retinopathy', confidence: '82.0%', doctor: 'Nurse Meera Syed', severity: 'Critical' },
-    { id: 'OCU-1126', patient: 'Paul Garnier',    age: 72, gender: 'Male',   date: '2026-04-24', result: 'AMD',                  confidence: '91.6%', doctor: 'Dr. Julian Voss',  severity: 'Moderate' },
-    { id: 'OCU-1128', patient: 'Tan Wei',         age: 48, gender: 'Male',   date: '2026-04-20', result: 'Glaucoma',             confidence: '90.8%', doctor: 'Dr. Julian Voss',  severity: 'Critical' },
-    { id: 'OCU-1129', patient: 'Siti Aminah',     age: 54, gender: 'Female', date: '2026-04-18', result: 'Healthy',              confidence: '98.1%', doctor: 'Nurse Meera Syed', severity: 'Healthy'  }
+    { id: 'OCU-H00001',   patient: 'Siti Aminah',     age: 54, gender: 'Female', date: '2026-04-18', result: 'Healthy',              confidence: '98.1%', doctor: 'Nurse Meera Syed', severity: 'Healthy'  },
+    { id: 'OCU-G00001',   patient: 'Tan Wei',         age: 48, gender: 'Male',   date: '2026-04-20', result: 'Glaucoma',             confidence: '90.8%', doctor: 'Dr. Julian Voss',  severity: 'Critical' },
+    { id: 'OCU-AMD00001', patient: 'Paul Garnier',    age: 72, gender: 'Male',   date: '2026-04-24', result: 'AMD',                  confidence: '91.6%', doctor: 'Dr. Julian Voss',  severity: 'Moderate' },
+    { id: 'OCU-DR00001',  patient: 'Aliyah Rahman',   age: 59, gender: 'Female', date: '2026-04-26', result: 'Diabetic Retinopathy', confidence: '82.0%', doctor: 'Nurse Meera Syed', severity: 'Critical' },
+    { id: 'OCU-H00002',   patient: 'Sarah Miller',    age: 26, gender: 'Female', date: '2026-04-27', result: 'Healthy',              confidence: '98.8%', doctor: 'Dr. Julian Voss',  severity: 'Healthy'  },
+    { id: 'OCU-G00002',   patient: 'Marcus Chen',     age: 41, gender: 'Male',   date: '2026-04-28', result: 'Early Glaucoma',       confidence: '87.4%', doctor: 'Dr. Julian Voss',  severity: 'Moderate' },
+    { id: 'OCU-H00003',   patient: 'Elena Rodriguez', age: 37, gender: 'Female', date: '2026-04-29', result: 'Healthy',              confidence: '99.2%', doctor: 'Dr. Julian Voss',  severity: 'Healthy'  }
 ];
 
 // --- JSON file helpers (fallback only) -------------------------------------
