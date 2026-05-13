@@ -8,7 +8,8 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const db = require('./db');
-const { runMatlabModel, isMatlabModelFile } = require('./matlab-runner');
+const { runMatlabModel, isMatlabModelFile, MATLAB_EXEC, COMPILED_EXE } = require('./matlab-runner');
+const { runPythonModel, isPythonEngineType, engineFromType, PYTHON_EXEC, MODELS_DIR: PY_MODELS_DIR } = require('./python-runner');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,6 +28,34 @@ const DEFAULT_MODEL = {
     uploadedAt: '2026-05-07T00:00:00.000Z',
     active: true
 };
+
+// Built-in Python pseudo-models. These aren't uploaded by the user; they
+// represent the in-tree inference pipelines under ./python/*. We ensure
+// they're present in models.json on every boot so the UI can list them as
+// selectable engines alongside the MATLAB Bagged Trees and any other
+// uploaded .mat models.
+const BUILTIN_PYTHON_MODELS = [
+    {
+        id: 'python-tabular-unet',
+        name: 'Python AI - U-Net + Tabular Classifier',
+        originalName: 'Built-in (python/python_predict.py --engine tabular)',
+        type: 'python-tabular',
+        size: 0,
+        uploadedAt: '2026-05-13T00:00:00.000Z',
+        active: false,
+        builtin: true
+    },
+    {
+        id: 'python-cnn-resnet50',
+        name: 'Python AI - End-to-End ResNet50 CNN',
+        originalName: 'Built-in (python/python_predict.py --engine cnn)',
+        type: 'python-cnn',
+        size: 0,
+        uploadedAt: '2026-05-13T00:00:00.000Z',
+        active: false,
+        builtin: true
+    }
+];
 
 // --- Auth helpers ----------------------------------------------------------
 function generateToken() {
@@ -59,17 +88,38 @@ function ensureModelRegistry() {
     }
 
     if (!fs.existsSync(MODEL_REGISTRY_FILE)) {
-        fs.writeFileSync(MODEL_REGISTRY_FILE, JSON.stringify([DEFAULT_MODEL], null, 2));
+        fs.writeFileSync(MODEL_REGISTRY_FILE,
+            JSON.stringify([DEFAULT_MODEL, ...BUILTIN_PYTHON_MODELS], null, 2));
     }
+}
+
+// Merge any built-in models we ship with the project into the on-disk
+// registry. Idempotent: if a built-in id already exists we leave it alone
+// (so the user's `active` choice survives a server restart). Returns the
+// possibly-updated array; caller decides whether to writeModels(...) it.
+function withBuiltinsMerged(models) {
+    const byId = new Map(models.map(m => [m.id, m]));
+    let changed = false;
+    for (const builtin of [DEFAULT_MODEL, ...BUILTIN_PYTHON_MODELS]) {
+        if (!byId.has(builtin.id)) {
+            models.push(builtin);
+            byId.set(builtin.id, builtin);
+            changed = true;
+        }
+    }
+    return { models, changed };
 }
 
 function readModels() {
     ensureModelRegistry();
     try {
-        const models = JSON.parse(fs.readFileSync(MODEL_REGISTRY_FILE, 'utf8'));
-        return Array.isArray(models) && models.length ? models : [DEFAULT_MODEL];
+        const raw = JSON.parse(fs.readFileSync(MODEL_REGISTRY_FILE, 'utf8'));
+        const arr = Array.isArray(raw) && raw.length ? raw : [DEFAULT_MODEL];
+        const { models, changed } = withBuiltinsMerged(arr.slice());
+        if (changed) writeModels(models);
+        return models;
     } catch (err) {
-        return [DEFAULT_MODEL];
+        return [DEFAULT_MODEL, ...BUILTIN_PYTHON_MODELS];
     }
 }
 
@@ -127,13 +177,53 @@ app.use(cors({
 // inside the record JSON body sent by the frontend.
 app.use(express.json({ limit: '25mb' }));
 
-// Base route to verify the API is running
-app.get('/', (req, res) => {
-    res.json({ 
-        status: "Online", 
+// Serve the OcuVision frontend (index.html + Calisto Logo.png + Background_Video.mp4
+// + any other root-level assets) from this Node process. This is what lets the
+// user open http://localhost:3000 and run the site against the LOCAL backend,
+// which is the only environment that can actually call MATLAB (GitHub Pages and
+// Render cannot host MATLAB). API routes below take precedence over file
+// matches with the same path because express.static only handles existing files
+// and falls through to the next handler otherwise.
+//
+// `dotfiles: 'deny'` prevents serving `.env`, `.git`, etc. The remaining JS/json
+// files in the folder (server.js, db.js, matlab-runner.js, package.json) are
+// the same source already published on GitHub, so exposing them locally is
+// harmless.
+app.use(express.static(__dirname, {
+    index: 'index.html',
+    dotfiles: 'deny',
+    setHeaders(res, filePath) {
+        if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        }
+    }
+}));
+
+// Health-check / API status (used to live at GET /, but / now serves index.html).
+app.get('/api/health', (req, res) => {
+    let matlabRuntime;
+    if (COMPILED_EXE) {
+        matlabRuntime = { mode: 'compiled', executable: COMPILED_EXE };
+    } else {
+        matlabRuntime = { mode: 'full-matlab', executable: MATLAB_EXEC };
+    }
+
+    const tabularReady = fs.existsSync(path.join(PY_MODELS_DIR, 'tabular_clf.pkl'));
+    const cnnReady     = fs.existsSync(path.join(PY_MODELS_DIR, 'cnn_clf.pth'));
+
+    res.json({
+        status: "Online",
         project: "OcuVision AI API",
         message: "Welcome to the Ophthalmic Intelligence Backend",
-        activeModel: getActiveModel().name
+        activeModel: getActiveModel().name,
+        runtime: matlabRuntime,
+        matlabConfigured: Boolean(MATLAB_EXEC) || Boolean(COMPILED_EXE),
+        python: {
+            interpreter: PYTHON_EXEC,
+            modelsDir: PY_MODELS_DIR,
+            tabularReady,
+            cnnReady
+        }
     });
 });
 
@@ -299,7 +389,7 @@ const DEMO_RESULTS = [
     {
         status: 'Optimal',
         score: '98.7',
-        result: 'No urgent retinal abnormality detected',
+        result: 'Healthy',
         severity: 'Healthy',
         notes: 'Fundus pattern is within baseline range for this demo backend screening.',
         features: {
@@ -333,42 +423,44 @@ function writeTempImage(buffer, originalName) {
 }
 
 // AI analysis endpoint used by the diagnostics image upload flow.
-// If the active model is a MATLAB script (.m / .mlx) it is executed via the
-// MATLAB runner; otherwise the demo backend logic returns a sample result.
+//
+// The frontend may include a `modelId` form field to choose which engine
+// runs for this specific scan (per-image picker on the upload page).
+// When `modelId` is omitted we fall back to the currently active model
+// from Settings -> AI Core.
+//
+// Routing:
+//   * Built-in python-tabular / python-cnn  -> runPythonModel(...)
+//   * Uploaded .mat / .m / .mlx             -> runMatlabModel(...)
+//   * Everything else                       -> demo result
 app.post('/api/analyze', upload.single('image'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No image uploaded.' });
     }
 
-    const activeModel = getActiveModel();
-    const modelName = activeModel?.name || 'Demo Retina Core';
-    const storedFile = activeModel?.storedFile
-        ? path.join(MODEL_DIR, activeModel.storedFile)
+    const requestedId = (req.body?.modelId || '').toString().trim();
+    const models = readModels();
+    const selectedModel = (requestedId && models.find(m => m.id === requestedId)) || getActiveModel();
+    const modelName = selectedModel?.name || 'Demo Retina Core';
+    const storedFile = selectedModel?.storedFile
+        ? path.join(MODEL_DIR, selectedModel.storedFile)
         : null;
 
     let tempImagePath = null;
     try {
-        // MATLAB path: only when a real .m / .mlx file has been uploaded.
-        if (
-            storedFile &&
-            fs.existsSync(storedFile) &&
-            isMatlabModelFile(activeModel.originalName || storedFile)
-        ) {
+        // ---- Python engines (built-in: tabular + CNN) ----
+        if (isPythonEngineType(selectedModel?.type)) {
             tempImagePath = writeTempImage(req.file.buffer, req.file.originalname);
-            const matlabRaw = await runMatlabModel({
-                scriptPath: storedFile,
-                imagePath: tempImagePath
-            });
+            const engine = engineFromType(selectedModel.type);
+            const pyRaw = await runPythonModel({ engine, imagePath: tempImagePath });
 
-            const diagnosis = matlabRaw.diagnosis || matlabRaw.result || 'No urgent retinal abnormality detected';
-            const scoreNum  = Number(matlabRaw.score ?? matlabRaw.confidence ?? 0);
+            const diagnosis = pyRaw.diagnosis || pyRaw.result || 'Healthy';
+            const scoreNum  = Number(pyRaw.score ?? pyRaw.confidence ?? 0);
             const scoreStr  = Number.isFinite(scoreNum) ? scoreNum.toFixed(1) : '0.0';
-            const severity  = matlabRaw.severity || 'Healthy';
-            const notes     = matlabRaw.notes || 'MATLAB model analysis completed.';
-            const status    = matlabRaw.status || deriveStatus(severity, diagnosis);
-            const features  = matlabRaw.features && typeof matlabRaw.features === 'object'
-                ? matlabRaw.features
-                : null;
+            const severity  = pyRaw.severity || 'Healthy';
+            const notes     = pyRaw.notes || 'Python AI model analysis completed.';
+            const status    = pyRaw.status || deriveStatus(severity, diagnosis);
+            const features  = pyRaw.features && typeof pyRaw.features === 'object' ? pyRaw.features : null;
 
             return res.json({
                 status,
@@ -379,24 +471,76 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
                 confidence: `${scoreStr}%`,
                 fileName: req.file.originalname,
                 features,
-                model: { id: activeModel.id, name: modelName, runtime: 'matlab' }
+                probs: pyRaw.probs || null,
+                model: {
+                    id: selectedModel.id,
+                    name: modelName,
+                    runtime: selectedModel.type,
+                    kind: pyRaw.modelKind || selectedModel.type
+                }
             });
         }
 
-        // Fallback: demo logic for the built-in model or non-MATLAB uploads.
+        // ---- MATLAB engines (.m / .mlx / .mat) ----
+        if (
+            storedFile &&
+            fs.existsSync(storedFile) &&
+            isMatlabModelFile(selectedModel.originalName || storedFile)
+        ) {
+            tempImagePath = writeTempImage(req.file.buffer, req.file.originalname);
+            const matlabRaw = await runMatlabModel({
+                scriptPath: storedFile,
+                imagePath: tempImagePath
+            });
+
+            const diagnosis = matlabRaw.diagnosis || matlabRaw.result || 'Healthy';
+            const scoreNum  = Number(matlabRaw.score ?? matlabRaw.confidence ?? 0);
+            const scoreStr  = Number.isFinite(scoreNum) ? scoreNum.toFixed(1) : '0.0';
+            const severity  = matlabRaw.severity || 'Healthy';
+            const notes     = matlabRaw.notes || 'MATLAB model analysis completed.';
+            const status    = matlabRaw.status || deriveStatus(severity, diagnosis);
+            const features  = matlabRaw.features && typeof matlabRaw.features === 'object'
+                ? matlabRaw.features
+                : null;
+
+            // Surface partial-prediction info to the server log only - it is
+            // useful for developers (so they know to supply formulas for the
+            // missing features) but should not appear in clinician-facing UI.
+            if (Array.isArray(matlabRaw.missingFeatures) && matlabRaw.missingFeatures.length > 0) {
+                console.warn(
+                    `[analyze] Model "${modelName}" returned a partial prediction: ` +
+                    `${matlabRaw.missingFeatures.length} feature(s) defaulted to 0 - ${matlabRaw.missingFeatures.join(', ')}. ` +
+                    `Raw class: "${matlabRaw.rawDiagnosis || diagnosis}".`
+                );
+            }
+
+            return res.json({
+                status,
+                score: scoreStr,
+                result: diagnosis,
+                severity,
+                notes,
+                confidence: `${scoreStr}%`,
+                fileName: req.file.originalname,
+                features,
+                model: { id: selectedModel.id, name: modelName, runtime: 'matlab' }
+            });
+        }
+
+        // ---- Demo / unsupported types ----
         const result = pickDemoResult();
         return res.json({
             ...result,
             confidence: `${result.score}%`,
             fileName: req.file.originalname,
             features: result.features || null,
-            model: { id: activeModel.id, name: modelName, runtime: activeModel.type || 'demo' }
+            model: { id: selectedModel.id, name: modelName, runtime: selectedModel.type || 'demo' }
         });
     } catch (err) {
-        console.error('[analyze] MATLAB pipeline failed:', err.message);
+        console.error(`[analyze] ${modelName} pipeline failed:`, err.message);
         return res.status(502).json({
-            error: `Active AI model failed to run: ${err.message}`,
-            model: { id: activeModel.id, name: modelName }
+            error: `AI model "${modelName}" failed to run: ${err.message}`,
+            model: { id: selectedModel?.id, name: modelName }
         });
     } finally {
         if (tempImagePath) {
@@ -462,8 +606,37 @@ app.post('/api/models/select', (req, res) => {
 });
 
 // --- Patient records CRUD --------------------------------------------------
-function nextRecordId() {
-    return `OCU-${Date.now().toString().slice(-6)}`;
+// Record IDs are condition-based so the registry stays human-readable:
+//   Healthy                 -> OCU-H00001, OCU-H00002, ...
+//   AMD / Macular Degen.    -> OCU-AMD00001, ...
+//   Diabetic Retinopathy    -> OCU-DR00001, ...
+//   Glaucoma (any stage)    -> OCU-G00001, ...
+// The numeric suffix is a 5-digit, zero-padded, monotonically increasing
+// counter scoped to that prefix. We compute it by scanning existing records,
+// which keeps the logic simple and works with both Supabase + local JSON.
+function getRecordIdPrefix(result, severity) {
+    const r = String(result || '').toLowerCase();
+    const s = String(severity || '').toLowerCase();
+    if (r.includes('amd') || r.includes('macular')) return 'OCU-AMD';
+    if (r.includes('diabetic') || r.includes('retinopathy') || /\bdr\b/.test(r)) return 'OCU-DR';
+    if (r.includes('glaucoma')) return 'OCU-G';
+    if (s === 'healthy' || r.includes('healthy') || r.includes('normal') || r.includes('no urgent')) return 'OCU-H';
+    return 'OCU-H';
+}
+
+async function nextRecordId(result, severity) {
+    const prefix = getRecordIdPrefix(result, severity);
+    const records = await db.getAllRecords();
+    const pattern = new RegExp(`^${prefix}(\\d+)$`);
+    let max = 0;
+    for (const r of records) {
+        const m = pattern.exec(r && r.id ? String(r.id) : '');
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (Number.isFinite(n) && n > max) max = n;
+        }
+    }
+    return `${prefix}${String(max + 1).padStart(5, '0')}`;
 }
 
 function normalizeRecordPayload(body = {}) {
@@ -501,16 +674,18 @@ app.post('/api/records', requireAuth, async (req, res, next) => {
         if (error) return res.status(400).json({ error });
         if (!record.patient) return res.status(400).json({ error: 'Patient name is required.' });
 
+        const result = record.result || 'Healthy';
+        const severity = record.severity || 'Healthy';
         const newRecord = {
-            id: req.body.id || nextRecordId(),
+            id: req.body.id || await nextRecordId(result, severity),
             patient: record.patient,
             age: record.age ?? 0,
             gender: record.gender || 'Other',
             date: record.date || new Date().toISOString().slice(0, 10),
-            result: record.result || 'No urgent retinal abnormality detected',
+            result,
             confidence: record.confidence || '0%',
             doctor: record.doctor || req.user.name || 'Unassigned',
-            severity: record.severity || 'Healthy',
+            severity,
             fundus_image: record.fundus_image || null,
             features: record.features || null,
             created_by: req.user.username,
