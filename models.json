@@ -1,0 +1,31 @@
+[
+  {
+    "id": "demo-retina-core",
+    "name": "Demo Retina Core",
+    "originalName": "Built-in demo backend logic",
+    "type": "demo",
+    "size": 0,
+    "uploadedAt": "2026-05-07T00:00:00.000Z",
+    "active": false
+  },
+  {
+    "id": "model-1778473803541",
+    "name": "99_BaggedTreesModel",
+    "originalName": "99_BaggedTreesModel.mat",
+    "storedFile": "1778473803499-99_BaggedTreesModel.mat",
+    "type": "mat",
+    "size": 1286519,
+    "uploadedAt": "2026-05-11T04:30:03.541Z",
+    "active": false
+  },
+  {
+    "id": "python-cnn-resnet50",
+    "name": "Python AI - End-to-End ResNet50 CNN",
+    "originalName": "Built-in (python/python_predict.py --engine cnn)",
+    "type": "python-cnn",
+    "size": 0,
+    "uploadedAt": "2026-05-13T00:00:00.000Z",
+    "active": true,
+    "builtin": true
+  }
+]
