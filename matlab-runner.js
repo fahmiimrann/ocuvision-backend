@@ -1,65 +1,73 @@
 /**
  * MATLAB integration for the OcuVision backend.
  *
- * Spawns a MATLAB process to run the user's uploaded model file against a
- * fundus image, and parses the structured result it prints to stdout.
+ * This module shells out to either:
  *
- * ----------------------------------------------------------------------------
- * Deployment requirements (one-time on the host running this Node server)
- * ----------------------------------------------------------------------------
- *   1. Install MATLAB R2019a or newer (or MATLAB Runtime + a compiled model).
- *   2. Make sure the `matlab` executable is on the PATH, OR set the absolute
- *      path to it via the MATLAB_EXEC environment variable.
+ *   (a) a full MATLAB installation (R2019a+), driving it with `-batch` so it
+ *       runs a small wrapper script (ocu_run.m) that calls the canonical
+ *       OcuVision feature pipeline in ocu_predict.m, OR
+ *
+ *   (b) the standalone executable built by MATLAB Compiler (ocu_main.exe on
+ *       Windows / ocu_main on Linux), which needs ONLY the free MATLAB
+ *       Runtime to be installed on the host — no MATLAB licence required.
+ *
+ * The choice between the two is made automatically:
+ *
+ *   * If the environment variable OCU_COMPILED_EXE is set and points to an
+ *     existing file, we use that.
+ *   * Otherwise we resolve a full MATLAB executable (MATLAB_EXEC env var, then
+ *     auto-detect under C:\Program Files\MATLAB\R*\bin\matlab.exe, then fall
+ *     back to "matlab" on PATH).
+ *
+ * Path (a) is the iteration loop on a developer machine; path (b) is what runs
+ * on the deployed server (Windows VM, GitHub Actions runner, etc.) so the
+ * production server never has to hold a MATLAB licence.
  *
  * ----------------------------------------------------------------------------
  * Supported model file types
  * ----------------------------------------------------------------------------
- *   .m   / .mlx :
- *       A function with the same name as the file. It must take a single
- *       argument — the absolute path of a fundus image — and return a struct
- *       { diagnosis, score, severity, notes }.
+ *   .mat                    Classification Learner export (must contain a
+ *                           struct with a predictFcn field). This is the
+ *                           normal case — driven by ocu_predict.m.
  *
- *   .mat :
- *       A Classification-Learner-style export. It must contain at least one
- *       struct variable (typically named `trainedModel`) that has a
- *       `predictFcn` field. This runner auto-generates a wrapper that:
- *         (a) loads the .mat,
- *         (b) extracts the OcuVision feature set from the uploaded image,
- *         (c) calls `trainedModel.predictFcn(featureTable)`,
- *         (d) maps the predicted label to the OcuVision result schema.
- *       The feature table column names match the columns shown in the
- *       Patient Report's "Extracted Features" section.
- *
- * ----------------------------------------------------------------------------
- * Example minimal predict.m:
- * ----------------------------------------------------------------------------
- *       function result = predict(imagePath)
- *           img = imread(imagePath);
- *           % ... your trained network or feature pipeline here ...
- *           result.diagnosis = 'Healthy';
- *           result.score     = 98.4;
- *           result.severity  = 'Healthy';
- *           result.notes     = 'Fundus pattern within baseline range.';
- *       end
+ *   .m / .mlx               Any custom MATLAB function that takes an image
+ *                           path and returns a struct with the OcuVision
+ *                           result schema. Only works in "full MATLAB" mode.
  */
 
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
+const PROJECT_DIR = __dirname;
+
 // ---------------------------------------------------------------------------
-// Locate the MATLAB executable.
-//
-// Priority:
-//   1. The MATLAB_EXEC environment variable (typically set via .env).
-//   2. On Windows, scan the standard install locations for the newest
-//      installed release (e.g. C:\Program Files\MATLAB\R2025b\bin\matlab.exe).
-//   3. Fall back to the bare command "matlab" and hope it's on PATH.
-//
-// This means a fresh clone of the project on a typical Windows workstation
-// will Just Work — no PowerShell env-var setup required — as long as MATLAB
-// itself is installed in the usual `Program Files\MATLAB\<RELEASE>\` layout.
+// Helpers
 // ---------------------------------------------------------------------------
+
+function quoteForMatlab(str) {
+    return String(str).replace(/'/g, "''");
+}
+
+function toForwardSlashes(p) {
+    return String(p).replace(/\\/g, '/');
+}
+
+function trimQuotes(value) {
+    if (!value) return '';
+    let s = String(value).trim();
+    if ((s.startsWith('"') && s.endsWith('"')) ||
+        (s.startsWith("'") && s.endsWith("'"))) {
+        s = s.slice(1, -1).trim();
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// Resolve the runtime: compiled .exe wins, otherwise full MATLAB.
+// ---------------------------------------------------------------------------
+
 function findMatlabOnWindows() {
     if (process.platform !== 'win32') return null;
     const roots = [
@@ -77,246 +85,277 @@ function findMatlabOnWindows() {
                     releases.push({ name: entry.name, exe });
                 }
             }
-        } catch (_) {
-            // Folder doesn't exist — skip silently.
-        }
+        } catch (_) { /* folder doesn't exist */ }
     }
     if (releases.length === 0) return null;
-    // Sort so that R-prefixed releases are picked newest first (R2025b > R2024a > R2023b).
     releases.sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
     return releases[0].exe;
 }
 
 function resolveMatlabExec() {
-    const fromEnv = (process.env.MATLAB_EXEC || '').trim();
+    const fromEnv = trimQuotes(process.env.MATLAB_EXEC);
     if (fromEnv) return fromEnv;
     const autoDetected = findMatlabOnWindows();
     if (autoDetected) return autoDetected;
     return 'matlab';
 }
 
-const MATLAB_EXEC = resolveMatlabExec();
+function resolveCompiledExe() {
+    const fromEnv = trimQuotes(process.env.OCU_COMPILED_EXE);
+    if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+
+    // Also accept the canonical location produced by compile_ocu.m.
+    const canonical = path.join(
+        PROJECT_DIR,
+        'dist',
+        process.platform === 'win32' ? 'ocu_main.exe' : 'ocu_main'
+    );
+    if (fs.existsSync(canonical)) return canonical;
+    return null;
+}
+
+const COMPILED_EXE     = resolveCompiledExe();
+const MATLAB_EXEC      = resolveMatlabExec();
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.MATLAB_TIMEOUT_MS || '120000', 10);
 
-// One-time startup log so the server operator can confirm which MATLAB binary
-// will be invoked when an .m / .mlx / .mat model is uploaded.
-console.log(`[matlab-runner] MATLAB executable resolved to: ${MATLAB_EXEC}`);
-
-function quoteForMatlab(str) {
-    return String(str).replace(/'/g, "''");
-}
-
-function toForwardSlashes(p) {
-    return String(p).replace(/\\/g, '/');
-}
-
-// ---------------------------------------------------------------------------
-// MATLAB code generators
-// ---------------------------------------------------------------------------
-
-// For .m / .mlx scripts: just addpath the directory and call the function.
-function buildScriptInvocation(scriptPath, imagePath) {
-    const scriptDir = toForwardSlashes(path.dirname(scriptPath));
-    const fnName    = path.basename(scriptPath, path.extname(scriptPath));
-    return [
-        `addpath('${quoteForMatlab(scriptDir)}');`,
-        `__ocu_result = ${fnName}('${quoteForMatlab(imagePath)}');`
-    ].join(' ');
-}
-
-// For .mat models: load the file, find the model struct, compute the
-// OcuVision feature table, call predictFcn, and translate the result.
-function buildMatInvocation(matPath, imagePath) {
-    return [
-        // -- 1. Load the .mat ------------------------------------------------
-        `__ocu_loaded = load('${quoteForMatlab(matPath)}');`,
-
-        // -- 2. Find a struct with a predictFcn field ------------------------
-        `__ocu_modelvar = [];`,
-        `__ocu_keys = fieldnames(__ocu_loaded);`,
-        `for __ocu_k = 1:numel(__ocu_keys)`,
-        `  __ocu_v = __ocu_loaded.(__ocu_keys{__ocu_k});`,
-        `  if isstruct(__ocu_v) && isfield(__ocu_v, 'predictFcn')`,
-        `    __ocu_modelvar = __ocu_v; break;`,
-        `  end`,
-        `end`,
-        `if isempty(__ocu_modelvar)`,
-        `  error('OCU: No struct with predictFcn was found in the .mat file. Expected a Classification Learner export (trainedModel.predictFcn).');`,
-        `end`,
-
-        // -- 3. Compute the OcuVision feature row from the image -------------
-        `__ocu_img = imread('${quoteForMatlab(imagePath)}');`,
-        `if size(__ocu_img,3) == 3, __ocu_gray = rgb2gray(__ocu_img); else, __ocu_gray = __ocu_img; end`,
-        `__ocu_gray = imresize(__ocu_gray, [512 512]);`,
-        `__ocu_vec  = double(__ocu_gray(:));`,
-        `__ocu_glcm = graycomatrix(__ocu_gray, 'NumLevels', 64, 'Symmetric', true);`,
-        `__ocu_stats = graycoprops(__ocu_glcm, {'Contrast','Correlation','Energy','Homogeneity'});`,
-        `[__ocu_h, ~] = imhist(uint8(__ocu_gray), 256);`,
-        `__ocu_p = __ocu_h / sum(__ocu_h);`,
-        `__ocu_pnz = __ocu_p(__ocu_p > 0);`,
-        `__ocu_mu = mean(__ocu_vec); __ocu_sd = std(__ocu_vec);`,
-        `__ocu_sk = skewness(__ocu_vec); __ocu_ku = kurtosis(__ocu_vec) - 3;`,
-        `__ocu_var = var(__ocu_vec);`,
-        `__ocu_ent = -sum(__ocu_pnz .* log2(__ocu_pnz));`,
-        `__ocu_uni = sum(__ocu_p .^ 2);`,
-        `__ocu_dyn = double(max(__ocu_gray(:))) - double(min(__ocu_gray(:)));`,
-
-        // Build the feature table. Vessel & ONH features use sensible
-        // baseline values because true vessel/optic-disc segmentation
-        // requires a separate deep model that is not in scope of this
-        // auto-wrapper. If the user's classifier was trained primarily on
-        // GLCM + intensity features, those columns will still drive the
-        // prediction correctly.
-        `__ocu_feats = table( ...`,
-        `  __ocu_stats.Contrast, __ocu_stats.Correlation, __ocu_stats.Energy, __ocu_stats.Homogeneity, ...`,
-        `  __ocu_mu, __ocu_sd, __ocu_sk, __ocu_ku, __ocu_var, log(1e-5 + abs(__ocu_ku)), 1 - 1/(1 + __ocu_var), ...`,
-        `  __ocu_ent, __ocu_uni, __ocu_dyn, ...`,
-        `  10.0, 0.30, 0.85, 7000, 0.35, ...`,
-        `  'VariableNames', { ...`,
-        `    'GLCM_Contrast','GLCM_Correlation','GLCM_Energy','GLCM_Homogeneity', ...`,
-        `    'Intensity_Mean','Intensity_StdDev','Intensity_Skewness','Intensity_Kurtosis', ...`,
-        `    'Intensity_Variance','Intensity_LogKurt','Intensity_Smoothness', ...`,
-        `    'Intensity_Entropy','Intensity_Uniformity','Intensity_DynRange', ...`,
-        `    'Vessel_GVD_pct','Vessel_MaxLVD','Vessel_Symmetry', ...`,
-        `    'ONH_DiscArea_px2','ONH_CupToDiscRatio'});`,
-
-        // -- 4. Run the classifier -------------------------------------------
-        `__ocu_pred = __ocu_modelvar.predictFcn(__ocu_feats);`,
-        `if iscell(__ocu_pred), __ocu_pred = __ocu_pred{1}; end`,
-        `if isnumeric(__ocu_pred), __ocu_pred = num2str(__ocu_pred); end`,
-        `__ocu_pred_str = char(string(__ocu_pred));`,
-
-        // -- 5. Map label to {diagnosis, score, severity, notes} -------------
-        `__ocu_low = lower(__ocu_pred_str);`,
-        `if contains(__ocu_low, 'healthy') || contains(__ocu_low, 'normal')`,
-        `  __ocu_sev = 'Healthy';`,
-        `elseif contains(__ocu_low, 'early') || contains(__ocu_low, 'amd')`,
-        `  __ocu_sev = 'Moderate';`,
-        `else`,
-        `  __ocu_sev = 'Critical';`,
-        `end`,
-        `__ocu_result = struct();`,
-        `__ocu_result.diagnosis = __ocu_pred_str;`,
-        `__ocu_result.score = 92.5;`,
-        `__ocu_result.severity = __ocu_sev;`,
-        `__ocu_result.notes = sprintf('Auto-wrapped .mat model prediction: %s', __ocu_pred_str);`,
-
-        // -- 6. Attach the feature vector so the Patient Report can render
-        //       the EXACT numbers the classifier saw, not random PRNG ones.
-        `__ocu_features = struct();`,
-        `__ocu_features.GLCM_Contrast        = __ocu_stats.Contrast;`,
-        `__ocu_features.GLCM_Correlation     = __ocu_stats.Correlation;`,
-        `__ocu_features.GLCM_Energy          = __ocu_stats.Energy;`,
-        `__ocu_features.GLCM_Homogeneity     = __ocu_stats.Homogeneity;`,
-        `__ocu_features.Intensity_Mean       = __ocu_mu;`,
-        `__ocu_features.Intensity_StdDev     = __ocu_sd;`,
-        `__ocu_features.Intensity_Skewness   = __ocu_sk;`,
-        `__ocu_features.Intensity_Kurtosis   = __ocu_ku;`,
-        `__ocu_features.Intensity_Variance   = __ocu_var;`,
-        `__ocu_features.Intensity_LogKurt    = log(1e-5 + abs(__ocu_ku));`,
-        `__ocu_features.Intensity_Smoothness = 1 - 1/(1 + __ocu_var);`,
-        `__ocu_features.Intensity_Entropy    = __ocu_ent;`,
-        `__ocu_features.Intensity_Uniformity = __ocu_uni;`,
-        `__ocu_features.Intensity_DynRange   = __ocu_dyn;`,
-        `__ocu_features.Vessel_GVD_pct       = 10.0;`,
-        `__ocu_features.Vessel_MaxLVD        = 0.30;`,
-        `__ocu_features.Vessel_Symmetry      = 0.85;`,
-        `__ocu_features.ONH_DiscArea_px2     = 7000;`,
-        `__ocu_features.ONH_CupToDiscRatio   = 0.35;`,
-        `__ocu_result.features = __ocu_features;`
-    ].join(' ');
-}
-
-function buildInvocation(scriptPath, imagePath) {
-    const ext = path.extname(scriptPath).toLowerCase();
-    const imgFwd = toForwardSlashes(imagePath);
-    if (ext === '.mat') {
-        return buildMatInvocation(toForwardSlashes(scriptPath), imgFwd);
+if (COMPILED_EXE) {
+    console.log(`[matlab-runner] using compiled executable: ${COMPILED_EXE}`);
+    console.log(`[matlab-runner] (no MATLAB licence required at runtime — only MATLAB Runtime)`);
+} else {
+    try {
+        const fileVisible = MATLAB_EXEC !== 'matlab' && fs.existsSync(MATLAB_EXEC);
+        console.log(
+            `[matlab-runner] using full MATLAB: ${MATLAB_EXEC}` +
+            ` (visible: ${fileVisible ? 'yes' : 'no'})`
+        );
+    } catch (_) {
+        console.log(`[matlab-runner] using full MATLAB: ${MATLAB_EXEC}`);
     }
-    return buildScriptInvocation(scriptPath, imgFwd);
 }
 
 // ---------------------------------------------------------------------------
-// MATLAB launcher
+// Common output handling. Both code paths funnel through this — they pipe
+// MATLAB stdout/stderr to the Node console (with the OCU_JSON block filtered
+// out so we don't dump a wall of JSON) and resolve once the JSON arrives.
 // ---------------------------------------------------------------------------
 
-function runMatlabModel({ scriptPath, imagePath, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function streamAndParse({ proc, timer, settle, cleanup, label, retainOnFailureHint }) {
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', chunk => {
+        const text = chunk.toString();
+        stdout += text;
+        const visible = text.replace(/OCU_JSON_BEGIN[\s\S]*?OCU_JSON_END/g, '<<json>>');
+        process.stdout.write(`[${label}] ${visible.replace(/\n/g, `\n[${label}] `)}`);
+    });
+    proc.stderr.on('data', chunk => {
+        const text = chunk.toString();
+        stderr += text;
+        process.stderr.write(`[${label}:err] ${text.replace(/\n/g, `\n[${label}:err] `)}`);
+    });
+
+    proc.on('close', code => {
+        clearTimeout(timer);
+        if (typeof cleanup === 'function') cleanup({ success: true });
+
+        const errMatch = stdout.match(/OCU_ERROR:([\s\S]*?)(?:OCU_JSON_BEGIN|$)/);
+        if (errMatch) {
+            return settle(false, new Error(`MATLAB error: ${errMatch[1].trim()}`));
+        }
+
+        const jsonMatch = stdout.match(/OCU_JSON_BEGIN([\s\S]*?)OCU_JSON_END/);
+        if (!jsonMatch) {
+            const detail = (stderr || stdout).trim().slice(-400);
+            return settle(false, new Error(
+                `MATLAB exited with code ${code} but did not return parseable JSON.` +
+                (retainOnFailureHint ? ` ${retainOnFailureHint}` : '') +
+                (detail ? ` Output tail: ${detail}` : '')
+            ));
+        }
+        try {
+            settle(true, JSON.parse(jsonMatch[1].trim()));
+        } catch (e) {
+            settle(false, new Error(`Failed to parse MATLAB JSON output: ${e.message}`));
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Path (a): drive full MATLAB with a tiny wrapper script that calls ocu_main.
+// ---------------------------------------------------------------------------
+
+function runFullMatlab({ scriptPath, imagePath, timeoutMs }) {
     return new Promise((resolve, reject) => {
-        if (!scriptPath) return reject(new Error('MATLAB scriptPath is required.'));
-        if (!imagePath)  return reject(new Error('MATLAB imagePath is required.'));
+        const ext = path.extname(scriptPath).toLowerCase();
 
-        const invocation = buildInvocation(scriptPath, imagePath);
+        // The wrapper script: cd into the OcuVision project dir (where
+        // ocu_predict.m + ocu_main.m live), then either call ocu_main on the
+        // .mat model, or addpath + call the user's custom function for
+        // legacy .m / .mlx uploads.
+        let invocation;
+        if (ext === '.mat') {
+            invocation = [
+                `addpath('${quoteForMatlab(toForwardSlashes(PROJECT_DIR))}');`,
+                `ocu_main('${quoteForMatlab(toForwardSlashes(scriptPath))}', '${quoteForMatlab(toForwardSlashes(imagePath))}');`
+            ].join('\n');
+        } else {
+            // .m / .mlx — assume the function name matches the file basename
+            // and that it returns the OcuVision result struct. We still
+            // wrap it in the same OCU_JSON delimiters that ocu_main uses.
+            const scriptDir = toForwardSlashes(path.dirname(scriptPath));
+            const fnName    = path.basename(scriptPath, ext);
+            invocation = [
+                `addpath('${quoteForMatlab(scriptDir)}');`,
+                `try`,
+                `  ocu_result = ${fnName}('${quoteForMatlab(toForwardSlashes(imagePath))}');`,
+                `  fprintf('OCU_JSON_BEGIN%sOCU_JSON_END', jsonencode(ocu_result));`,
+                `catch ocu_err`,
+                `  fprintf('OCU_ERROR:%s', ocu_err.message);`,
+                `end`
+            ].join('\n');
+        }
 
-        // Wrap in try/catch and delimit the JSON output so we can ignore any
-        // banners or warnings MATLAB prints around it.
-        const matlabCode = [
-            `try`,
-            invocation,
-            `  fprintf('OCU_JSON_BEGIN%sOCU_JSON_END', jsonencode(__ocu_result));`,
-            `catch __ocu_err`,
-            `  fprintf('OCU_ERROR:%s', __ocu_err.message);`,
-            `end`,
-            `exit;`
-        ].join(' ');
+        // Sanitise any stray non-ASCII characters (em-dashes, curly quotes,
+        // non-breaking spaces) that could sneak in through a copy-pasted
+        // folder path and confuse MATLAB's parser.
+        const sanitised = invocation
+            .replace(/[\u2010-\u2015]/g, '-')
+            .replace(/[\u2018\u2019]/g, "'")
+            .replace(/[\u201C\u201D]/g, '"')
+            .replace(/\u00A0/g, ' ');
 
-        const proc = spawn(MATLAB_EXEC, ['-batch', matlabCode], {
-            windowsHide: true
-        });
+        // Write the wrapper to a temp .m file with a UTF-8 BOM so MATLAB
+        // reads it deterministically regardless of system locale.
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocuvision-matlab-'));
+        const scriptName = 'ocu_run';
+        const tempScriptPath = path.join(tempDir, `${scriptName}.m`);
+        const utf8Bom = Buffer.from([0xEF, 0xBB, 0xBF]);
+        fs.writeFileSync(tempScriptPath, Buffer.concat([utf8Bom, Buffer.from(sanitised, 'utf8')]));
 
-        let stdout = '';
-        let stderr = '';
+        const cleanup = ({ success }) => {
+            try {
+                if (success) {
+                    fs.unlinkSync(tempScriptPath);
+                    fs.rmdirSync(tempDir);
+                } else {
+                    console.log(`[matlab-runner] temp script retained for inspection: ${tempScriptPath}`);
+                }
+            } catch (_) {}
+        };
+
+        const batchPayload = `cd('${quoteForMatlab(toForwardSlashes(tempDir))}'); ${scriptName}`;
+        console.log(`[matlab-runner] launching MATLAB: ${tempScriptPath}`);
+
+        const proc = spawn(MATLAB_EXEC, ['-batch', batchPayload], { windowsHide: true });
+
         let settled = false;
-
-        const finish = (fn, value) => {
+        const settle = (ok, payload) => {
             if (settled) return;
             settled = true;
-            fn(value);
+            (ok ? resolve : reject)(payload);
         };
 
         const timer = setTimeout(() => {
             try { proc.kill('SIGKILL'); } catch (_) {}
-            finish(reject, new Error(`MATLAB analysis timed out after ${timeoutMs} ms.`));
+            cleanup({ success: false });
+            settle(false, new Error(`MATLAB analysis timed out after ${timeoutMs} ms.`));
         }, timeoutMs);
 
-        proc.stdout.on('data', chunk => { stdout += chunk.toString(); });
-        proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+        proc.on('error', err => {
+            clearTimeout(timer);
+            cleanup({ success: false });
+            if (err.code === 'ENOENT') {
+                const exists = (() => { try { return fs.existsSync(MATLAB_EXEC); } catch (_) { return false; } })();
+                return settle(false, new Error(
+                    `Could not launch MATLAB ("${MATLAB_EXEC}"). ` +
+                    (exists
+                        ? `The file exists on disk but Windows refused to execute it. ` +
+                          `Try opening MATLAB once from the Start menu to refresh the licence, ` +
+                          `or check that anti-virus is not blocking matlab.exe.`
+                        : `Node cannot see that file from its working directory. ` +
+                          `Fix the MATLAB_EXEC value in .env (no surrounding quotes — write ` +
+                          `MATLAB_EXEC=C:\\Program Files\\MATLAB\\R2025b\\bin\\matlab.exe).`)
+                ));
+            }
+            settle(false, err);
+        });
+
+        streamAndParse({
+            proc, timer, settle,
+            cleanup: ({ success }) => cleanup({ success }),
+            label: 'matlab',
+            retainOnFailureHint: `Inspect: ${tempScriptPath}`
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Path (b): run the compiled standalone executable.
+//
+// The .exe takes two positional arguments — modelPath and imagePath — and
+// prints OCU_JSON_BEGIN<json>OCU_JSON_END to stdout. It does NOT need MATLAB
+// to be installed; only the MATLAB Runtime (a free, redistributable runtime
+// from MathWorks). The Runtime version must match the MATLAB release used to
+// build the .exe (compile_ocu.m uses your current MATLAB).
+// ---------------------------------------------------------------------------
+
+function runCompiledExe({ scriptPath, imagePath, timeoutMs }) {
+    return new Promise((resolve, reject) => {
+        const ext = path.extname(scriptPath).toLowerCase();
+        if (ext !== '.mat') {
+            // .m / .mlx scripts can't be driven through the compiled .exe.
+            // Fall back to the full-MATLAB path automatically.
+            return runFullMatlab({ scriptPath, imagePath, timeoutMs }).then(resolve, reject);
+        }
+
+        console.log(`[matlab-runner] launching compiled exe: ${COMPILED_EXE}`);
+        const proc = spawn(COMPILED_EXE, [scriptPath, imagePath], { windowsHide: true });
+
+        let settled = false;
+        const settle = (ok, payload) => {
+            if (settled) return;
+            settled = true;
+            (ok ? resolve : reject)(payload);
+        };
+
+        const timer = setTimeout(() => {
+            try { proc.kill('SIGKILL'); } catch (_) {}
+            settle(false, new Error(`Compiled OcuVision pipeline timed out after ${timeoutMs} ms.`));
+        }, timeoutMs);
 
         proc.on('error', err => {
             clearTimeout(timer);
             if (err.code === 'ENOENT') {
-                return finish(reject, new Error(
-                    `Could not launch MATLAB ("${MATLAB_EXEC}"). ` +
-                    `Install MATLAB or set the MATLAB_EXEC environment variable to its absolute path.`
+                return settle(false, new Error(
+                    `Could not launch the OcuVision executable ("${COMPILED_EXE}"). ` +
+                    `Make sure MATLAB Runtime is installed and the .exe path in .env is correct.`
                 ));
             }
-            finish(reject, err);
+            settle(false, err);
         });
 
-        proc.on('close', code => {
-            clearTimeout(timer);
-
-            const errMatch = stdout.match(/OCU_ERROR:([\s\S]*?)(?:OCU_JSON_BEGIN|$)/);
-            if (errMatch) {
-                return finish(reject, new Error(`MATLAB error: ${errMatch[1].trim()}`));
-            }
-
-            const jsonMatch = stdout.match(/OCU_JSON_BEGIN([\s\S]*?)OCU_JSON_END/);
-            if (!jsonMatch) {
-                const detail = (stderr || stdout).trim().slice(-400);
-                return finish(reject, new Error(
-                    `MATLAB exited with code ${code} but did not return parseable JSON.` +
-                    (detail ? ` Output tail: ${detail}` : '')
-                ));
-            }
-
-            try {
-                const parsed = JSON.parse(jsonMatch[1].trim());
-                finish(resolve, parsed);
-            } catch (e) {
-                finish(reject, new Error(`Failed to parse MATLAB JSON output: ${e.message}`));
-            }
+        streamAndParse({
+            proc, timer, settle,
+            cleanup: null,
+            label: 'ocu_exe',
+            retainOnFailureHint: 'Did the MATLAB Runtime install correctly on this host?'
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+function runMatlabModel({ scriptPath, imagePath, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    if (!scriptPath) return Promise.reject(new Error('MATLAB scriptPath is required.'));
+    if (!imagePath)  return Promise.reject(new Error('MATLAB imagePath is required.'));
+
+    if (COMPILED_EXE) {
+        return runCompiledExe({ scriptPath, imagePath, timeoutMs });
+    }
+    return runFullMatlab({ scriptPath, imagePath, timeoutMs });
 }
 
 function isMatlabModelFile(filename = '') {
@@ -324,8 +363,21 @@ function isMatlabModelFile(filename = '') {
     return ext === '.m' || ext === '.mlx' || ext === '.mat';
 }
 
+// Returns true when this host can actually run a MATLAB model — either because
+// the compiled standalone .exe exists, or because MATLAB_EXEC resolved to a
+// real file on disk. Used by server.js to gracefully fall back to the demo
+// backend instead of hard-failing when MATLAB isn't installed on this machine.
+function isMatlabAvailable() {
+
+    if (COMPILED_EXE) return true;
+    if (!MATLAB_EXEC || MATLAB_EXEC === 'matlab') return false;
+    try { return fs.existsSync(MATLAB_EXEC); } catch (_) { return false; }
+}
+
 module.exports = {
     runMatlabModel,
     isMatlabModelFile,
-    MATLAB_EXEC
+    isMatlabAvailable,
+    MATLAB_EXEC,
+    COMPILED_EXE
 };
