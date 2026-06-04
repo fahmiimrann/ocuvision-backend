@@ -8,7 +8,7 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const db = require('./db');
-const { runMatlabModel, isMatlabModelFile, MATLAB_EXEC, COMPILED_EXE } = require('./matlab-runner');
+const { runMatlabModel, isMatlabModelFile, isMatlabAvailable, MATLAB_EXEC, COMPILED_EXE } = require('./matlab-runner');
 const { runPythonModel, isPythonEngineType, engineFromType, PYTHON_EXEC, MODELS_DIR: PY_MODELS_DIR } = require('./python-runner');
 
 const app = express();
@@ -35,16 +35,6 @@ const DEFAULT_MODEL = {
 // selectable engines alongside the MATLAB Bagged Trees and any other
 // uploaded .mat models.
 const BUILTIN_PYTHON_MODELS = [
-    {
-        id: 'python-tabular-unet',
-        name: 'Python AI - U-Net + Tabular Classifier',
-        originalName: 'Built-in (python/python_predict.py --engine tabular)',
-        type: 'python-tabular',
-        size: 0,
-        uploadedAt: '2026-05-13T00:00:00.000Z',
-        active: false,
-        builtin: true
-    },
     {
         id: 'python-cnn-resnet50',
         name: 'Python AI - End-to-End ResNet50 CNN',
@@ -487,6 +477,31 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
             fs.existsSync(storedFile) &&
             isMatlabModelFile(selectedModel.originalName || storedFile)
         ) {
+            // If this host has no MATLAB / MATLAB Runtime installed, don't even
+            // try to spawn it — fall back to the demo backend with a transparent
+            // note so the website stays usable on machines without MATLAB.
+            if (!isMatlabAvailable()) {
+                console.warn(
+                    `[analyze] MATLAB is not available on this host ` +
+                    `(MATLAB_EXEC="${MATLAB_EXEC}", compiledExe=${Boolean(COMPILED_EXE)}). ` +
+                    `Falling back to demo backend for model "${modelName}".`
+                );
+                const fallback = pickDemoResult();
+                return res.json({
+                    ...fallback,
+                    notes: `${fallback.notes} (MATLAB not detected on this machine — demo backend used instead of "${modelName}". Install MATLAB or switch the active engine to Demo Retina Core to remove this notice.)`,
+                    confidence: `${fallback.score}%`,
+                    fileName: req.file.originalname,
+                    features: fallback.features || null,
+                    model: {
+                        id: selectedModel.id,
+                        name: modelName,
+                        runtime: 'demo-fallback',
+                        requestedRuntime: 'matlab'
+                    }
+                });
+            }
+
             tempImagePath = writeTempImage(req.file.buffer, req.file.originalname);
             const matlabRaw = await runMatlabModel({
                 scriptPath: storedFile,
