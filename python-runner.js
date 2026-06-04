@@ -151,7 +151,19 @@ function runPythonModel({ engine, imagePath, timeoutMs = DEFAULT_TIMEOUT_MS } = 
         const proc = spawn(PYTHON_EXEC, args, {
             windowsHide: true,
             cwd: PY_DIR,                  // so 'import unet' / 'import feature_extraction' resolve
-            env: { ...process.env, PYTHONUNBUFFERED: '1' },
+            env: {
+                ...process.env,
+                PYTHONUNBUFFERED: '1',
+                // Force UTF-8 on stdout/stderr from process start. Without
+                // this, Python adopts the host's default codepage (cp950
+                // on Traditional-Chinese Windows, cp1252 on Western
+                // Europe, …) and any non-ASCII glyph in our OCU_* logs
+                // raises a UnicodeEncodeError that surfaces as a generic
+                // "Python error" in the UI. Belt-and-suspenders with the
+                // sys.stdout.reconfigure() call at the top of
+                // python_predict.py.
+                PYTHONIOENCODING: 'utf-8',
+            },
         });
 
         let settled = false;
