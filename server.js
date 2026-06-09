@@ -489,7 +489,7 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
                 const fallback = pickDemoResult();
                 return res.json({
                     ...fallback,
-                    notes: `${fallback.notes} (MATLAB not detected on this machine — demo backend used instead of "${modelName}". Install MATLAB or switch the active engine to Demo Retina Core to remove this notice.)`,
+                    notes: `${fallback.notes} (MATLAB not detected on this machine — demo backend used instead of "${modelName}". Install MATLAB or switch the active engine to Demo Retina Core.)`,
                     confidence: `${fallback.score}%`,
                     fileName: req.file.originalname,
                     features: fallback.features || null,
